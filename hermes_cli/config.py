@@ -703,6 +703,11 @@ DEFAULT_CONFIG = {
         "personality": "kawaii",
         "resume_display": "full",
         "busy_input_mode": "interrupt",  # interrupt | queue | steer
+        # When true, `hermes --tui` auto-resumes the most recent human-
+        # facing session on launch instead of forging a fresh one.
+        # Mirrors `hermes -c` muscle memory.  Default off so existing
+        # users aren't surprised.  HERMES_TUI_RESUME=<id> always wins.
+        "tui_auto_resume_recent": False,
         "bell_on_complete": False,
         "show_reasoning": False,
         "streaming": False,
@@ -710,6 +715,9 @@ DEFAULT_CONFIG = {
         "inline_diffs": True,     # Show inline diff previews for write actions (write_file, patch, skill_manage)
         "show_cost": False,       # Show $ cost in the status bar (off by default)
         "skin": "default",
+        # TUI busy indicator style: kaomoji (default), emoji, unicode (braille
+        # spinner), or ascii.  Live-swappable via `/indicator <style>`.
+        "tui_status_indicator": "kaomoji",
         "user_message_preview": {  # CLI: how many submitted user-message lines to echo back in scrollback
             "first_lines": 2,
             "last_lines": 2,
@@ -905,6 +913,35 @@ DEFAULT_CONFIG = {
         # External hub installs (trusted/community sources) are always
         # scanned regardless of this setting.
         "guard_agent_created": False,
+    },
+
+    # Curator — background skill maintenance.
+    #
+    # Periodically reviews AGENT-CREATED skills (never bundled or
+    # hub-installed) and keeps the collection tidy: marks long-unused skills
+    # as stale, archives genuinely obsolete ones (archive only, never
+    # deletes), and spawns a forked aux-model agent to consolidate overlaps
+    # and patch drift. Runs inactivity-triggered from session start — no
+    # cron daemon.
+    #
+    # See `hermes curator status` for the last run summary.
+    "curator": {
+        "enabled": True,
+        # How long to wait between curator runs (hours).  Default: 7 days.
+        "interval_hours": 24 * 7,
+        # Only run when the agent has been idle at least this long (hours).
+        "min_idle_hours": 2,
+        # Mark a skill as "stale" after this many days without use.
+        "stale_after_days": 30,
+        # Archive a skill (move to skills/.archive/) after this many days
+        # without use. Archived skills are recoverable — no auto-deletion.
+        "archive_after_days": 90,
+        # Optional per-task override for the curator's aux model. Leave null
+        # to use Hermes' main auxiliary client resolution.
+        "auxiliary": {
+            "provider": None,
+            "model": None,
+        },
     },
 
     # Honcho AI-native memory -- reads ~/.honcho/config.json as single source of truth.
@@ -1218,6 +1255,22 @@ OPTIONAL_ENV_VARS = {
     "NVIDIA_BASE_URL": {
         "description": "NVIDIA NIM base URL override (e.g. http://localhost:8000/v1 for local NIM)",
         "prompt": "NVIDIA NIM base URL (leave empty for default)",
+        "url": None,
+        "password": False,
+        "category": "provider",
+        "advanced": True,
+    },
+    "LM_API_KEY": {
+        "description": "LM Studio bearer token for auth-enabled local servers",
+        "prompt": "LM Studio API key / bearer token",
+        "url": None,
+        "password": True,
+        "category": "provider",
+        "advanced": True,
+    },
+    "LM_BASE_URL": {
+        "description": "LM Studio base URL override",
+        "prompt": "LM Studio base URL (leave empty for default)",
         "url": None,
         "password": False,
         "category": "provider",
@@ -3686,18 +3739,27 @@ def _sanitize_env_lines(lines: list) -> list:
 
         # Detect concatenated KEY=VALUE pairs on one line.
         # Search for known KEY= patterns at any position in the line.
-        split_positions = []
+        # We collect full needle ranges so we can drop matches that are
+        # fully contained within a longer overlapping needle. Without this,
+        # suffix collisions corrupt the file: e.g. LM_API_KEY= inside
+        # GLM_API_KEY= would otherwise split the line into "G\nLM_API_KEY=...".
+        match_ranges: list[tuple[int, int]] = []
         for key_name in known_keys:
             needle = key_name + "="
             idx = stripped.find(needle)
             while idx >= 0:
-                split_positions.append(idx)
+                match_ranges.append((idx, idx + len(needle)))
                 idx = stripped.find(needle, idx + len(needle))
 
+        split_positions = sorted({
+            s for s, e in match_ranges
+            if not any(
+                s2 <= s and e2 >= e and (s2, e2) != (s, e)
+                for s2, e2 in match_ranges
+            )
+        })
+
         if len(split_positions) > 1:
-            split_positions.sort()
-            # Deduplicate (shouldn't happen, but be safe)
-            split_positions = sorted(set(split_positions))
             for i, pos in enumerate(split_positions):
                 end = split_positions[i + 1] if i + 1 < len(split_positions) else len(stripped)
                 part = stripped[pos:end].strip()
@@ -3806,7 +3868,7 @@ def save_env_value(key: str, value: str):
     value = _check_non_ascii_credential(key, value)
     ensure_hermes_home()
     env_path = get_env_path()
-    
+
     # On Windows, open() defaults to the system locale (cp1252) which can
     # cause OSError errno 22 on UTF-8 .env files.
     read_kw = {"encoding": "utf-8", "errors": "replace"} if _IS_WINDOWS else {}
@@ -3818,7 +3880,7 @@ def save_env_value(key: str, value: str):
             lines = f.readlines()
         # Sanitize on every read: split concatenated keys, drop stale placeholders
         lines = _sanitize_env_lines(lines)
-    
+
     # Find and update or append
     found = False
     for i, line in enumerate(lines):
@@ -3826,7 +3888,7 @@ def save_env_value(key: str, value: str):
             lines[i] = f"{key}={value}\n"
             found = True
             break
-    
+
     if not found:
         # Ensure there's a newline at the end of the file before appending
         if lines and not lines[-1].endswith("\n"):
@@ -3989,12 +4051,13 @@ def get_env_value(key: str) -> Optional[str]:
 # =============================================================================
 
 def redact_key(key: str) -> str:
-    """Redact an API key for display."""
-    if not key:
-        return color("(not set)", Colors.DIM)
-    if len(key) < 12:
-        return "***"
-    return key[:4] + "..." + key[-4:]
+    """Redact an API key for display.
+
+    Thin wrapper over :func:`agent.redact.mask_secret` — preserves the
+    "(not set)" placeholder in dim color for the empty case.
+    """
+    from agent.redact import mask_secret
+    return mask_secret(key, empty=color("(not set)", Colors.DIM))
 
 
 def show_config():

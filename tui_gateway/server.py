@@ -140,6 +140,7 @@ _SLASH_WORKER_TIMEOUT_S = max(
 # response writes are safe.
 _LONG_HANDLERS = frozenset(
     {
+        "browser.manage",
         "cli.exec",
         "session.branch",
         "session.resume",
@@ -491,6 +492,13 @@ def _normalize_completion_path(path_part: str) -> str:
 # ── Config I/O ────────────────────────────────────────────────────────
 
 
+# Keep aligned with `INDICATOR_STYLES` / `DEFAULT_INDICATOR_STYLE` in
+# ``ui-tui/src/app/interfaces.ts`` — both ends validate against the
+# same shape so `config.get indicator` and the live TUI render agree.
+_INDICATOR_STYLES: tuple[str, ...] = ("ascii", "emoji", "kaomoji", "unicode")
+_INDICATOR_DEFAULT = "kaomoji"
+
+
 def _load_cfg() -> dict:
     global _cfg_cache, _cfg_mtime, _cfg_path
     try:
@@ -681,6 +689,21 @@ def _coerce_statusbar(raw) -> str:
     if isinstance(raw, str) and (s := raw.strip().lower()) in _STATUSBAR_MODES:
         return s
     return "top"
+
+
+def _display_mouse_tracking(display: dict) -> bool:
+    """Return canonical display.mouse_tracking with legacy tui_mouse fallback."""
+    if not isinstance(display, dict):
+        return True
+    if "mouse_tracking" in display:
+        raw = display.get("mouse_tracking")
+    else:
+        raw = display.get("tui_mouse", True)
+    if raw is False or raw == 0:
+        return False
+    if isinstance(raw, str):
+        return raw.strip().lower() not in {"0", "false", "no", "off"}
+    return True
 
 
 def _load_reasoning_config() -> dict | None:
@@ -1786,6 +1809,50 @@ def _(rid, params: dict) -> dict:
         )
     except Exception as e:
         return _err(rid, 5006, str(e))
+
+
+@method("session.most_recent")
+def _(rid, params: dict) -> dict:
+    """Return the most recent human-facing session id, or ``None``.
+
+    Mirrors ``session.list``'s deny-list behaviour (drops ``tool``
+    sub-agent rows).  Used by TUI auto-resume when
+    ``display.tui_auto_resume_recent`` is on; the field is also handy
+    for any CLI tooling that wants "latest session" without paginating
+    the full list.
+
+    Contract: a ``{"session_id": null}`` result means "no eligible
+    session found right now".  Errors are also folded into that
+    null-result shape (and logged) so callers don't have to special-
+    case JSON-RPC error envelopes for what is a normal "no answer".
+    """
+    db = _get_db()
+    if db is None:
+        return _ok(rid, {"session_id": None})
+    try:
+        deny = frozenset({"tool"})
+        # Over-fetch by a generous bounded amount so heavy sub-agent
+        # users (lots of recent ``tool`` rows) don't get a false
+        # "no eligible session" answer.  ``session.list`` uses a
+        # similar over-fetch strategy.
+        rows = db.list_sessions_rich(source=None, limit=200)
+        for row in rows:
+            src = (row.get("source") or "").strip().lower()
+            if src in deny:
+                continue
+            return _ok(
+                rid,
+                {
+                    "session_id": row.get("id"),
+                    "title": row.get("title") or "",
+                    "started_at": row.get("started_at") or 0,
+                    "source": row.get("source") or "",
+                },
+            )
+        return _ok(rid, {"session_id": None})
+    except Exception:
+        logger.exception("session.most_recent failed")
+        return _ok(rid, {"session_id": None})
 
 
 @method("session.resume")
@@ -3121,12 +3188,9 @@ def _(rid, params: dict) -> dict:
 
     if key == "mouse":
         raw = str(value or "").strip().lower()
-        display = (
-            _load_cfg().get("display")
-            if isinstance(_load_cfg().get("display"), dict)
-            else {}
-        )
-        current = bool(display.get("tui_mouse", True))
+        cfg = _load_cfg()
+        display = cfg.get("display") if isinstance(cfg.get("display"), dict) else {}
+        current = _display_mouse_tracking(display)
 
         if raw in ("", "toggle"):
             nv = not current
@@ -3137,8 +3201,22 @@ def _(rid, params: dict) -> dict:
         else:
             return _err(rid, 4002, f"unknown mouse value: {value}")
 
-        _write_config_key("display.tui_mouse", nv)
+        _write_config_key("display.mouse_tracking", nv)
         return _ok(rid, {"key": key, "value": "on" if nv else "off"})
+
+    if key == "indicator":
+        # Use an explicit None check rather than `value or ""` so falsy
+        # non-string inputs (0, False, []) still surface as themselves
+        # in the error message instead of looking like a blank value.
+        raw = ("" if value is None else str(value)).strip().lower()
+        if raw not in _INDICATOR_STYLES:
+            return _err(
+                rid,
+                4002,
+                f"unknown indicator: {raw!r}; pick one of {'|'.join(_INDICATOR_STYLES)}",
+            )
+        _write_config_key("display.tui_status_indicator", raw)
+        return _ok(rid, {"key": key, "value": raw})
 
     if key in ("prompt", "personality", "skin"):
         try:
@@ -3209,6 +3287,18 @@ def _(rid, params: dict) -> dict:
     if key == "skin":
         return _ok(
             rid, {"value": (_load_cfg().get("display") or {}).get("skin", "default")}
+        )
+    if key == "indicator":
+        # Normalize so a hand-edited config.yaml with stray casing or
+        # an unknown value reads back the SAME value the TUI actually
+        # rendered (frontend's `normalizeIndicatorStyle` falls back to
+        # `_INDICATOR_DEFAULT` for the same inputs).  Otherwise
+        # `/indicator` would print one thing while the UI shows another.
+        raw = (_load_cfg().get("display") or {}).get("tui_status_indicator", "")
+        norm = str(raw).strip().lower()
+        return _ok(
+            rid,
+            {"value": norm if norm in _INDICATOR_STYLES else _INDICATOR_DEFAULT},
         )
     if key == "personality":
         return _ok(
@@ -3285,7 +3375,7 @@ def _(rid, params: dict) -> dict:
         return _ok(rid, {"value": _coerce_statusbar(raw)})
     if key == "mouse":
         display = _load_cfg().get("display")
-        on = display.get("tui_mouse", True) if isinstance(display, dict) else True
+        on = _display_mouse_tracking(display)
         return _ok(rid, {"value": "on" if on else "off"})
     if key == "mtime":
         cfg_path = _hermes_home / "config.yaml"
@@ -3339,6 +3429,27 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 5015, str(e))
 
 
+@method("reload.env")
+def _(rid, params: dict) -> dict:
+    """Re-read ``~/.hermes/.env`` into the gateway process via
+    ``hermes_cli.config.reload_env``, matching classic CLI's ``/reload``
+    handler.  Newly added API keys take effect on the next agent call
+    without restarting the TUI.
+
+    The credential pool / provider routing for any *already-constructed*
+    agent does not auto-rebuild — that's the same behaviour as classic
+    CLI's ``/reload``.  Users who want a brand-new credential resolution
+    should follow with ``/new``.
+    """
+    try:
+        from hermes_cli.config import reload_env
+
+        count = reload_env()
+        return _ok(rid, {"updated": int(count)})
+    except Exception as e:
+        return _err(rid, 5015, str(e))
+
+
 _TUI_HIDDEN: frozenset[str] = frozenset(
     {
         "sethome",
@@ -3354,6 +3465,7 @@ _TUI_HIDDEN: frozenset[str] = frozenset(
 _TUI_EXTRA: list[tuple[str, str, str]] = [
     ("/compact", "Toggle compact display mode", "TUI"),
     ("/logs", "Show recent gateway log lines", "TUI"),
+    ("/mouse", "Toggle mouse/wheel tracking [on|off|toggle]", "TUI"),
 ]
 
 # Commands that queue messages onto _pending_input in the CLI.
@@ -4133,6 +4245,11 @@ def _(rid, params: dict) -> dict:
                 "display": "/logs",
                 "meta": "Show recent gateway log lines",
             },
+            {
+                "text": "/mouse",
+                "display": "/mouse",
+                "meta": "Toggle mouse/wheel tracking [on|off|toggle]",
+            },
         ]
         for extra in extras:
             if extra["text"].startswith(text_lower) and not any(
@@ -4168,6 +4285,7 @@ def _(rid, params: dict) -> dict:
         cfg = _load_cfg()
         current_provider = getattr(agent, "provider", "") or ""
         current_model = getattr(agent, "model", "") or _resolve_model()
+        current_base_url = getattr(agent, "base_url", "") or ""
         # list_authenticated_providers already populates each provider's
         # "models" with the curated list (same source as `hermes model` and
         # classic CLI's /model picker). Do NOT overwrite with live
@@ -4176,6 +4294,8 @@ def _(rid, params: dict) -> dict:
         # TTS, embeddings, rerankers, image/video generators).
         providers = list_authenticated_providers(
             current_provider=current_provider,
+            current_base_url=current_base_url,
+            current_model=current_model,
             user_providers=(
                 cfg.get("providers") if isinstance(cfg.get("providers"), dict) else {}
             ),
@@ -4621,54 +4741,241 @@ def _(rid, params: dict) -> dict:
 # ── Methods: browser / plugins / cron / skills ───────────────────────
 
 
+def _resolve_browser_cdp_url() -> str:
+    """Return the configured browser CDP override without network I/O.
+
+    ``/browser status`` must be fast — calling
+    ``tools.browser_tool._get_cdp_override`` would invoke
+    ``_resolve_cdp_override``, which performs an HTTP probe to
+    ``.../json/version`` for discovery-style URLs.  That probe has
+    a multi-second timeout and would block the TUI on a slow or
+    unreachable host even though status only needs to report whether
+    an override is set.
+
+    Mirrors the env/config precedence of ``_get_cdp_override`` (env
+    var first, then ``browser.cdp_url`` from config.yaml) without the
+    websocket-resolution step, so the answer reflects user intent
+    even when the configured host is not currently reachable.  The
+    actual WS normalization happens in ``browser_navigate`` on the
+    next tool call.
+    """
+    env_url = os.environ.get("BROWSER_CDP_URL", "").strip()
+    if env_url:
+        return env_url
+    try:
+        from hermes_cli.config import read_raw_config
+
+        cfg = read_raw_config()
+        browser_cfg = cfg.get("browser", {}) if isinstance(cfg, dict) else {}
+        if isinstance(browser_cfg, dict):
+            return str(browser_cfg.get("cdp_url", "") or "").strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _is_default_local_cdp(parsed) -> bool:
+    """Match the discovery-style local default; never the concrete WS form.
+
+    A user-supplied ``ws://127.0.0.1:9222/devtools/browser/<id>`` is a
+    real, connectable endpoint — collapsing it to bare ``http://...:9222``
+    would strip the path and break the connect.
+    """
+    try:
+        port = parsed.port or 80
+    except ValueError:
+        return False
+
+    discovery_path = parsed.path in {"", "/", "/json", "/json/version"}
+    return (
+        parsed.scheme in {"http", "ws"}
+        and parsed.hostname in {"127.0.0.1", "localhost"}
+        and port == 9222
+        and discovery_path
+    )
+
+
+def _http_ok(url: str, timeout: float) -> bool:
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            return 200 <= getattr(resp, "status", 200) < 300
+    except Exception:
+        return False
+
+
+def _probe_urls(parsed) -> list[str]:
+    scheme = {"ws": "http", "wss": "https"}.get(parsed.scheme, parsed.scheme)
+    root = f"{scheme}://{parsed.netloc}".rstrip("/")
+    return [f"{root}/json/version", f"{root}/json"]
+
+
+def _normalize_cdp_url(parsed) -> str:
+    # Concrete ``/devtools/browser/<id>`` endpoints (Browserbase et al.)
+    # are connectable as-is. Discovery-style inputs collapse to bare
+    # ``scheme://host:port`` so ``_resolve_cdp_override`` can append
+    # ``/json/version`` later without doubling the path.
+    if parsed.path.startswith("/devtools/browser/"):
+        return parsed.geturl()
+    return parsed._replace(path="", params="", query="", fragment="").geturl()
+
+
+def _failure_messages(url: str, port: int, system: str) -> list[str]:
+    from hermes_cli.browser_connect import manual_chrome_debug_command
+
+    command = manual_chrome_debug_command(port, system)
+    hint = (
+        ["Start Chrome with remote debugging, then retry /browser connect:", command]
+        if command
+        else [
+            "No Chrome/Chromium executable was found in this environment.",
+            f"Install one or start Chrome with --remote-debugging-port={port}, then retry /browser connect.",
+        ]
+    )
+    return [
+        f"Chrome is not reachable at {url}.",
+        *hint,
+        "Browser not connected — start Chrome with remote debugging and retry /browser connect",
+    ]
+
+
 @method("browser.manage")
 def _(rid, params: dict) -> dict:
     action = params.get("action", "status")
-    if action == "status":
-        url = os.environ.get("BROWSER_CDP_URL", "")
-        return _ok(rid, {"connected": bool(url), "url": url})
-    if action == "connect":
-        url = params.get("url", "http://localhost:9222")
-        try:
-            import urllib.request
-            from urllib.parse import urlparse
-            from tools.browser_tool import cleanup_all_browsers
 
-            parsed = urlparse(url if "://" in url else f"http://{url}")
-            if parsed.scheme not in {"http", "https", "ws", "wss"}:
-                return _err(rid, 4015, f"unsupported browser url: {url}")
-            probe_root = f"{'https' if parsed.scheme == 'wss' else 'http' if parsed.scheme == 'ws' else parsed.scheme}://{parsed.netloc}"
-            probe_urls = [
-                f"{probe_root.rstrip('/')}/json/version",
-                f"{probe_root.rstrip('/')}/json",
-            ]
-            ok = False
-            for probe in probe_urls:
-                try:
-                    with urllib.request.urlopen(probe, timeout=2.0) as resp:
-                        if 200 <= getattr(resp, "status", 200) < 300:
+    if action == "status":
+        url = _resolve_browser_cdp_url()
+        return _ok(rid, {"connected": bool(url), "url": url})
+
+    if action == "disconnect":
+        return _browser_disconnect(rid)
+
+    if action != "connect":
+        return _err(rid, 4015, f"unknown action: {action}")
+
+    return _browser_connect(rid, params)
+
+
+def _browser_connect(rid, params: dict) -> dict:
+    import platform
+
+    from hermes_cli.browser_connect import DEFAULT_BROWSER_CDP_URL
+    from tools.browser_tool import cleanup_all_browsers
+    from urllib.parse import urlparse
+
+    raw_url = params.get("url")
+    if raw_url is not None and not isinstance(raw_url, str):
+        return _err(rid, 4015, f"browser url must be a string, got {type(raw_url).__name__}")
+    url = (raw_url or "").strip() or DEFAULT_BROWSER_CDP_URL
+
+    sid = params.get("session_id") or ""
+    system = platform.system()
+    messages: list[str] = []
+
+    def announce(message: str, *, level: str = "info") -> None:
+        messages.append(message)
+        # Without a session id the TUI prints `messages` from the
+        # response; emitting an event would double-render. Only stream
+        # progress when there's a real session to scope it to.
+        if sid:
+            _emit("browser.progress", sid, {"message": message, "level": level})
+
+    parsed = urlparse(url if "://" in url else f"http://{url}")
+    if parsed.scheme not in {"http", "https", "ws", "wss"}:
+        return _err(rid, 4015, f"unsupported browser url: {url}")
+    if not parsed.hostname:
+        return _err(rid, 4015, f"missing host in browser url: {url}")
+    try:
+        port = parsed.port or (443 if parsed.scheme in {"https", "wss"} else 80)
+    except ValueError:
+        return _err(rid, 4015, f"invalid port in browser url: {url}")
+
+    # Always normalize default-local to 127.0.0.1:9222 so downstream
+    # comparisons + messaging match what we'll actually persist.
+    if _is_default_local_cdp(parsed):
+        url = DEFAULT_BROWSER_CDP_URL
+        parsed = urlparse(url)
+        port = parsed.port or 9222
+
+    try:
+        # ws[s]://.../devtools/browser/<id> endpoints (hosted CDP
+        # providers) don't serve the HTTP discovery path; just check
+        # TCP-level reachability and let browser_navigate handshake.
+        if parsed.scheme in {"ws", "wss"} and parsed.path.startswith(
+            "/devtools/browser/"
+        ):
+            import socket
+
+            try:
+                with socket.create_connection((parsed.hostname, port), timeout=2.0):
+                    pass
+            except OSError as e:
+                return _err(rid, 5031, f"could not reach browser CDP at {url}: {e}")
+        else:
+            probes = _probe_urls(parsed)
+            ok = any(_http_ok(p, timeout=2.0) for p in probes)
+
+            if not ok and _is_default_local_cdp(parsed):
+                from hermes_cli.browser_connect import try_launch_chrome_debug
+
+                announce(
+                    "Chrome isn't running with remote debugging — attempting to launch..."
+                )
+
+                if try_launch_chrome_debug(port, system):
+                    for _ in range(20):
+                        time.sleep(0.5)
+                        if any(_http_ok(p, timeout=1.0) for p in probes):
                             ok = True
                             break
-                except Exception:
-                    continue
-            if not ok:
-                return _err(rid, 5031, f"could not reach browser CDP at {url}")
 
-            os.environ["BROWSER_CDP_URL"] = url
-            cleanup_all_browsers()
-        except Exception as e:
-            return _err(rid, 5031, str(e))
-        return _ok(rid, {"connected": True, "url": url})
-    if action == "disconnect":
-        os.environ.pop("BROWSER_CDP_URL", None)
+                if ok:
+                    announce(f"Chrome launched and listening on port {port}")
+                else:
+                    for line in _failure_messages(url, port, system)[1:]:
+                        announce(line, level="error")
+                    return _ok(
+                        rid, {"connected": False, "url": url, "messages": messages}
+                    )
+            elif not ok:
+                return _err(rid, 5031, f"could not reach browser CDP at {url}")
+            elif _is_default_local_cdp(parsed):
+                announce(f"Chrome is already listening on port {port}")
+
+        normalized = _normalize_cdp_url(parsed)
+
+        # Order matters: reap sessions BEFORE publishing the new env
+        # so an in-flight tool call sees the old supervisor closed,
+        # then again AFTER so the default task's cached supervisor
+        # is drained against the new URL.
+        cleanup_all_browsers()
+        os.environ["BROWSER_CDP_URL"] = normalized
+        cleanup_all_browsers()
+    except Exception as e:
+        return _err(rid, 5031, str(e))
+
+    payload: dict[str, object] = {"connected": True, "url": normalized}
+    if messages:
+        payload["messages"] = messages
+    return _ok(rid, payload)
+
+
+def _browser_disconnect(rid) -> dict:
+    # Reap, drop the env override, reap again — closes the same swap
+    # window covered by ``_browser_connect``.
+    def reap() -> None:
         try:
             from tools.browser_tool import cleanup_all_browsers
 
             cleanup_all_browsers()
         except Exception:
             pass
-        return _ok(rid, {"connected": False})
-    return _err(rid, 4015, f"unknown action: {action}")
+
+    reap()
+    os.environ.pop("BROWSER_CDP_URL", None)
+    reap()
+    return _ok(rid, {"connected": False})
 
 
 @method("plugins.list")
